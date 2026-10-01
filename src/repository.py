@@ -1,12 +1,7 @@
 import json
 import sqlite3
-from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
-
-
-def utcnow():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from .domain import ConflictError, NotFoundError, utcnow
 
 
 class SQLiteRepository:

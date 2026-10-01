@@ -1,6 +1,11 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class DomainError(Exception):
@@ -42,6 +47,7 @@ class Role(str, Enum):
 class Actor:
     user_id: str
     role: str
+    station_id: str = None
 
     @classmethod
     def from_headers(cls, headers):
@@ -49,7 +55,8 @@ class Actor:
         role = headers.get("X-Role", "viewer")
         if role not in {item.value for item in Role}:
             raise PermissionDenied("unknown role: " + role)
-        return cls(user_id=user_id, role=role)
+        station_id = headers.get("X-Station-Id") or None
+        return cls(user_id=user_id, role=role, station_id=station_id)
 
 
 @dataclass
