@@ -31,6 +31,41 @@ def measurements_overlap(first_start, first_end, second_start, second_end):
     return str(first_start) < str(second_end) and str(second_start) < str(first_end)
 
 
+def _measurement_identity(item):
+    """Dedup key for a measurement: a station timestamp never collides with another station."""
+    return item.get("station_id"), item.get("observed_at")
+
+
+def authorize_station(actor, station_id, lookup, require):
+    """Authorize an actor acting on behalf of a station.
+
+    Observers (operator role) are bound to one registered station and may only
+    submit that station's measurements. Analysts merge without a station.
+    require=True limits the action to station staff; require=False additionally
+    allows non-staff roles but forbids them from impersonating a station.
+    """
+    station = _find_one(lookup, "station", "id", station_id) if station_id else None
+    if actor.role == "admin":
+        if station_id and not station:
+            raise ValidationError("station does not exist")
+        return station
+    if actor.role == "operator":
+        if not station_id:
+            raise PermissionDenied("observer must present X-Station-Id")
+        if not station:
+            raise ValidationError("station does not exist")
+        if actor.user_id not in (station["data"].get("observer_ids") or []):
+            raise PermissionDenied("observer is not assigned to station " + str(station_id))
+        if station["status"] != "active":
+            raise ConflictError("station is not active")
+        return station
+    if require:
+        raise PermissionDenied("role %s is not allowed for a station action" % actor.role)
+    if station_id:
+        raise PermissionDenied("role %s cannot act on behalf of a station" % actor.role)
+    return None
+
+
 def _validate_source(actor, data, lookup):
     if len(str(data.get("name", "")).strip()) < 2:
         raise ValidationError("source name is required")
@@ -82,6 +117,83 @@ def _validate_observation(actor, data, lookup):
     return {"scheduled_team": data.get("team_id")}
 
 
+def _validate_station(actor, data, lookup):
+    if len(str(data.get("name", "")).strip()) < 2:
+        raise ValidationError("station name is required")
+    site = str(data.get("site_name", "")).strip()
+    if not site:
+        raise ValidationError("station site_name is required")
+    observers = data.get("observer_ids", [])
+    if observers is None:
+        observers = []
+    if not isinstance(observers, list) or any(not str(item).strip() for item in observers):
+        raise ValidationError("observer_ids must be a list of user ids")
+    return {"observer_ids": list(observers)}
+
+
+def _validate_measurement_batch(actor, data, lookup):
+    """Validate a batch of measurements buffered locally while a station was offline."""
+    candidate = _find_one(lookup, "candidate", "id", data.get("candidate_id"))
+    if not candidate:
+        raise ValidationError("candidate does not exist")
+    if candidate["status"] not in ("detected", "triaged"):
+        raise InvalidTransition("candidate %s does not accept measurements" % candidate["status"])
+    authorize_station(actor, data.get("station_id"), lookup, require=True)
+
+    raw_items = data.get("measurements")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValidationError("measurements must be a non-empty list")
+    items, identities = [], set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            raise ValidationError("each measurement must be an object")
+        try:
+            ra = float(raw.get("ra"))
+            dec = float(raw.get("dec"))
+            magnitude = float(raw.get("magnitude"))
+        except (TypeError, ValueError):
+            raise ValidationError("measurement coordinates and magnitude must be numeric")
+        if ra < 0 or ra >= 360 or dec < -90 or dec > 90:
+            raise ValidationError("measurement coordinates are outside valid ranges")
+        try:
+            calculate_priority(magnitude, candidate["data"].get("transient_type"))
+        except ValidationError as exc:
+            raise ValidationError("measurement magnitude is invalid: " + str(exc))
+        observed_at = str(raw.get("observed_at", "")).strip()
+        if not observed_at:
+            raise ValidationError("measurement observed_at is required")
+        item = {
+            "observed_at": observed_at,
+            "ra": ra,
+            "dec": dec,
+            "magnitude": magnitude,
+            "station_id": data.get("station_id"),
+        }
+        identity = _measurement_identity(item)
+        if identity in identities:
+            raise ValidationError("duplicate measurement timestamp inside batch: " + observed_at)
+        existing = candidate["data"].get("measurements") or []
+        if any(_measurement_identity(old) == identity for old in existing):
+            raise ValidationError("measurement timestamp already merged: " + observed_at)
+        identities.add(identity)
+        items.append(item)
+    items.sort(key=lambda item: (item["observed_at"], str(item.get("station_id"))))
+    pending = [dict(item, status="pending") for item in items]
+    return {
+        "candidate_id": candidate["id"],
+        "station_id": data.get("station_id"),
+        "measurements": pending,
+        "submitted_at": None,
+    }
+
+
+def _validate_assign_observers(actor, entity, data, lookup):
+    observers = data.get("observer_ids")
+    if not isinstance(observers, list) or any(not str(item).strip() for item in observers):
+        raise ValidationError("observer_ids must be a list of user ids")
+    return {"observer_ids": list(observers)}
+
+
 def _validate_merge_measurement(actor, entity, data, lookup):
     measurement = data.get("measurement")
     if not isinstance(measurement, dict):
@@ -97,16 +209,32 @@ def _validate_merge_measurement(actor, entity, data, lookup):
     observed_at = str(measurement.get("observed_at", "")).strip()
     if not observed_at:
         raise ValidationError("measurement observed_at is required")
+    station = authorize_station(actor, data.get("station_id"), lookup, require=False)
+    station_id = data.get("station_id") if station is not None else None
+    incoming = {"observed_at": observed_at, "ra": ra, "dec": dec, "magnitude": magnitude}
+    if station_id:
+        incoming["station_id"] = station_id
     existing = list(entity["data"].get("measurements") or [])
-    if any(item.get("observed_at") == observed_at for item in existing):
+    identity = _measurement_identity(incoming)
+    if any(_measurement_identity(item) == identity for item in existing):
         raise ConflictError("measurement timestamp already merged")
-    merged = existing + [{"observed_at": observed_at, "ra": ra, "dec": dec, "magnitude": magnitude}]
-    latest = sorted(merged, key=lambda item: item["observed_at"])[-1]
+    merged = existing + [incoming]
+    latest = sorted(
+        merged,
+        key=lambda item: (str(item.get("observed_at")), str(item.get("station_id"))),
+    )[-1]
+    previous_magnitude = entity["data"].get("latest_magnitude")
+    priority_score = calculate_priority(latest["magnitude"], entity["data"].get("transient_type"))
+    # Keep raw request keys out of the candidate record; station_id lives on the
+    # measurement itself, not on the candidate.
+    data.pop("measurement", None)
+    data.pop("station_id", None)
     return {
         "measurements": merged,
         "merged_measurement_count": len(merged),
         "latest_magnitude": latest["magnitude"],
-        "priority_score": calculate_priority(latest["magnitude"], entity["data"].get("transient_type")),
+        "priority_score": priority_score,
+        "priority_recalculated": previous_magnitude != latest["magnitude"],
     }
 
 
@@ -154,12 +282,16 @@ class RuleEngine:
         "candidates": "candidate",
         "telescopes": "telescope",
         "observations": "observation",
+        "stations": "station",
+        "measurement_batches": "measurement_batch",
     }
     INITIAL_STATUS = {
         "source": "registered",
         "candidate": "detected",
         "telescope": "available",
         "observation": "requested",
+        "station": "registered",
+        "measurement_batch": "queued",
     }
     TRANSITIONS = {
         "source": {
@@ -184,12 +316,25 @@ class RuleEngine:
             "withdraw": (("requested", "scheduled"), "withdrawn"),
             "correct": (("requested", "scheduled"), "requested"),
         },
+        "station": {
+            "activate": (("registered",), "active"),
+            "deactivate": (("active",), "inactive"),
+            "reactivate": (("inactive",), "active"),
+            "retire": (("registered", "active", "inactive"), "retired"),
+            "assign_observers": (("registered", "active", "inactive"), "active"),
+        },
+        "measurement_batch": {
+            "submit": (("queued", "partial"), "partial"),
+            "retry": (("partial",), "partial"),
+        },
     }
     CREATE_REQUIRED = {
         "source": ("name", "survey_name"),
         "candidate": ("source_id", "event_id", "ra", "dec", "magnitude", "transient_type", "observed_at"),
         "telescope": ("name", "aperture_m", "site_name"),
         "observation": ("candidate_id", "telescope_id", "team_id", "start_at", "end_at", "mode"),
+        "station": ("name", "site_name"),
+        "measurement_batch": ("candidate_id", "station_id", "measurements"),
     }
     ACTION_REQUIRED = {
         ("source", "retire"): ("reason",),
@@ -203,12 +348,17 @@ class RuleEngine:
         ("observation", "schedule"): ("operator_id",),
         ("observation", "withdraw"): ("reason",),
         ("observation", "correct"): ("reason",),
+        ("station", "deactivate"): ("reason",),
+        ("station", "retire"): ("reason",),
+        ("station", "assign_observers"): ("observer_ids",),
     }
     CREATE_ROLES = {
         "source": ("analyst", "admin"),
         "candidate": ("analyst", "operator", "admin"),
         "telescope": ("coordinator", "admin"),
         "observation": ("analyst", "coordinator", "admin"),
+        "station": ("coordinator", "admin"),
+        "measurement_batch": ("operator", "admin"),
     }
     ROLE_ACTIONS = {
         "activate": ("coordinator", "admin"),
@@ -223,12 +373,19 @@ class RuleEngine:
         "restore": ("coordinator", "admin"),
         "schedule": ("coordinator", "admin"),
         "complete": ("operator", "coordinator", "admin"),
+        "deactivate": ("coordinator", "admin"),
+        "reactivate": ("coordinator", "admin"),
+        ("station", "assign_observers"): ("coordinator", "admin"),
+        ("measurement_batch", "submit"): ("operator", "admin"),
+        ("measurement_batch", "retry"): ("operator", "admin"),
     }
     CUSTOM_CREATE = {
         "source": _validate_source,
         "candidate": _validate_candidate,
         "telescope": _validate_telescope,
         "observation": _validate_observation,
+        "station": _validate_station,
+        "measurement_batch": _validate_measurement_batch,
     }
     CUSTOM_TRANSITIONS = {
         ("candidate", "merge_measurement"): _validate_merge_measurement,
@@ -236,6 +393,7 @@ class RuleEngine:
         ("candidate", "correct"): _validate_correct,
         ("observation", "schedule"): _validate_schedule,
         ("observation", "correct"): _validate_correct,
+        ("station", "assign_observers"): _validate_assign_observers,
     }
 
     def normalize_kind(self, kind):

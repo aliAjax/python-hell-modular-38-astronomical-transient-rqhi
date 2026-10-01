@@ -14,13 +14,13 @@
 <body>
 <main>
   <h1>天文瞬变事件警报与后续观测</h1>
-  <p>候选事件、测量合并、望远镜观测申请和审计通过JSON接口管理。</p>
+  <p>候选事件、台站离线测量批次、测量合并、望远镜观测申请和审计通过JSON接口管理。观测台站提交测量需带<code>X-Station-Id</code>。</p>
   <p><button onclick="checkHealth()">检查服务状态</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-POST /api/entities/&lt;id&gt;/actions
+POST /api/&lt;kind&gt;                      (station / measurement_batch ...)
+POST /api/entities/&lt;id&gt;/actions       (submit / retry ...)
 GET  /api/audit</pre>
 </main>
 <script>
